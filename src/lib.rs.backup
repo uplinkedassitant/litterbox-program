@@ -1,0 +1,369 @@
+// LitterBox v2 - Production Ready
+// Based on solana-ts-transpiler vault pattern
+#![no_std]
+
+use pinocchio::{
+    account_info::AccountInfo,
+    cpi::invoke_signed,
+    instruction::{AccountMeta, Instruction, Signer},
+    program_entrypoint,
+    program_error::ProgramError,
+    pubkey::{self, Pubkey},
+    seeds,
+    sysvars::{rent::Rent, Sysvar},
+    ProgramResult,
+};
+use pinocchio_tkn::common::{MintTo, Transfer};
+
+program_entrypoint!(process_instruction);
+
+#[cfg(target_arch = "bpf")]
+use pinocchio::default_allocator;
+#[cfg(target_arch = "bpf")]
+default_allocator!();
+#[cfg(target_arch = "bpf")]
+#[panic_handler]
+fn panic_handler(_info: &core::panic::PanicInfo<'_>) -> ! {
+    unsafe { pinocchio::syscalls::abort() }
+}
+
+#[cfg(not(target_arch = "bpf"))]
+extern crate std;
+
+// ── Constants ────────────────────────────────────────────────────────────────
+const CONFIG_SEED: &[u8] = b"config";
+const POOL_SEED: &[u8] = b"virtual_pool_v2";
+const MIN_DEPOSIT_USDC: u64 = 1_000_000;
+const SYSTEM_PROGRAM: Pubkey = [0u8; 32];
+
+// ── Config Account (74 bytes) ───────────────────────────────────────────────
+#[derive(Clone, Copy)]
+struct Config {
+    authority: Pubkey,
+    litter_mint: Pubkey,
+    config_bump: u8,
+    mode: u8,
+    graduation_threshold: u64,
+}
+
+impl Config {
+    const LEN: usize = 74; // 32 + 32 + 1 + 1 + 8
+
+    fn load(account: &AccountInfo) -> Result<Self, ProgramError> {
+        let data = account.try_borrow_data()?;
+        if data.len() < Self::LEN {
+            return Err(ProgramError::AccountDataTooSmall);
+        }
+        let mut authority_bytes = [0u8; 32];
+        let mut mint_bytes = [0u8; 32];
+        let mut threshold_bytes = [0u8; 8];
+        authority_bytes.copy_from_slice(&data[0..32]);
+        mint_bytes.copy_from_slice(&data[32..64]);
+        threshold_bytes.copy_from_slice(&data[66..74]);
+        Ok(Self {
+            authority: authority_bytes,
+            litter_mint: mint_bytes,
+            config_bump: data[64],
+            mode: data[65],
+            graduation_threshold: u64::from_le_bytes(threshold_bytes),
+        })
+    }
+
+    fn store(account: &AccountInfo, state: &Self) -> Result<(), ProgramError> {
+        let mut data = account.try_borrow_mut_data()?;
+        if data.len() < Self::LEN {
+            return Err(ProgramError::AccountDataTooSmall);
+        }
+        data[0..32].copy_from_slice(state.authority.as_ref());
+        data[32..64].copy_from_slice(state.litter_mint.as_ref());
+        data[64] = state.config_bump;
+        data[65] = state.mode;
+        data[66..74].copy_from_slice(&state.graduation_threshold.to_le_bytes());
+        Ok(())
+    }
+}
+
+// ── VirtualPool Account (40 bytes with explicit padding) ───────────────────
+#[derive(Clone, Copy)]
+struct VirtualPool {
+    virtual_usdc: u64,
+    virtual_litter: u64,
+    real_usdc: u64,
+    graduation_threshold: u64,
+    pool_bump: u8,
+    _padding: [u8; 7], // Explicit padding to ensure 40 bytes total
+}
+
+impl VirtualPool {
+    const LEN: usize = 40; // 8 + 8 + 8 + 8 + 1 + 7 = 40
+
+    fn load(account: &AccountInfo) -> Result<Self, ProgramError> {
+        let data = account.try_borrow_data()?;
+        if data.len() < Self::LEN {
+            return Err(ProgramError::AccountDataTooSmall);
+        }
+        let mut usdc_bytes = [0u8; 8];
+        let mut litter_bytes = [0u8; 8];
+        let mut real_bytes = [0u8; 8];
+        let mut threshold_bytes = [0u8; 8];
+        usdc_bytes.copy_from_slice(&data[0..8]);
+        litter_bytes.copy_from_slice(&data[8..16]);
+        real_bytes.copy_from_slice(&data[16..24]);
+        threshold_bytes.copy_from_slice(&data[24..32]);
+        Ok(Self {
+            virtual_usdc: u64::from_le_bytes(usdc_bytes),
+            virtual_litter: u64::from_le_bytes(litter_bytes),
+            real_usdc: u64::from_le_bytes(real_bytes),
+            graduation_threshold: u64::from_le_bytes(threshold_bytes),
+            pool_bump: data[32],
+            _padding: [0; 7],
+        })
+    }
+
+    fn store(account: &AccountInfo, state: &Self) -> Result<(), ProgramError> {
+        let mut data = account.try_borrow_mut_data()?;
+        if data.len() < Self::LEN {
+            return Err(ProgramError::AccountDataTooSmall);
+        }
+        data[0..8].copy_from_slice(&state.virtual_usdc.to_le_bytes());
+        data[8..16].copy_from_slice(&state.virtual_litter.to_le_bytes());
+        data[16..24].copy_from_slice(&state.real_usdc.to_le_bytes());
+        data[24..32].copy_from_slice(&state.graduation_threshold.to_le_bytes());
+        data[32] = state.pool_bump;
+        // Padding bytes 33-39 remain zero
+        Ok(())
+    }
+}
+
+// ── Instruction Processor ───────────────────────────────────────────────────
+fn process_instruction(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
+    if data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    match data[0] {
+        0 => process_initialize(program_id, accounts, &data[1..]),
+        1 => process_deposit(program_id, accounts, &data[1..]),
+        _ => Err(ProgramError::InvalidInstructionData),
+    }
+}
+
+// ── Initialize ──────────────────────────────────────────────────────────────
+fn process_initialize(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
+    if data.len() < 56 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let authority = &accounts[0];
+    let config_acc = &accounts[1];
+    let pool_acc = &accounts[2];
+    let litter_mint = &accounts[3];
+    let system_program = &accounts[4];
+
+    if !authority.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    // Parse instruction data
+    let mut virtual_usdc_bytes = [0u8; 8];
+    let mut virtual_litter_bytes = [0u8; 8];
+    let mut threshold_bytes = [0u8; 8];
+    let mut mint_bytes = [0u8; 32];
+    virtual_usdc_bytes.copy_from_slice(&data[0..8]);
+    virtual_litter_bytes.copy_from_slice(&data[8..16]);
+    threshold_bytes.copy_from_slice(&data[16..24]);
+    mint_bytes.copy_from_slice(&data[24..56]);
+
+    let virtual_usdc = u64::from_le_bytes(virtual_usdc_bytes);
+    let virtual_litter = u64::from_le_bytes(virtual_litter_bytes);
+    let graduation_threshold = u64::from_le_bytes(threshold_bytes);
+    let litter_mint_key = mint_bytes;
+
+    // Derive PDAs
+    let (config_pda, config_bump) = pubkey::find_program_address(&[CONFIG_SEED], program_id);
+    let (pool_pda, pool_bump) = pubkey::find_program_address(&[POOL_SEED], program_id);
+
+    if config_acc.key() != &config_pda || pool_acc.key() != &pool_pda {
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    // Create Config account
+    let config_bump_bytes = [config_bump];
+    let config_seeds = seeds!(CONFIG_SEED, &config_bump_bytes);
+    let config_signer = Signer::from(&config_seeds);
+
+    create_program_account(
+        authority,
+        config_acc,
+        program_id,
+        system_program,
+        Config::LEN,
+        Some(&config_signer),
+    )?;
+
+    // Create Pool account
+    let pool_bump_bytes = [pool_bump];
+    let pool_seeds = seeds!(POOL_SEED, &pool_bump_bytes);
+    let pool_signer = Signer::from(&pool_seeds);
+
+    create_program_account(
+        authority,
+        pool_acc,
+        program_id,
+        system_program,
+        VirtualPool::LEN,
+        Some(&pool_signer),
+    )?;
+
+    // Initialize Config
+    let config = Config {
+        authority: *authority.key(),
+        litter_mint: litter_mint_key,
+        config_bump,
+        mode: 0,
+        graduation_threshold,
+    };
+    Config::store(config_acc, &config)?;
+
+    // Initialize Pool
+    let pool = VirtualPool {
+        virtual_usdc,
+        virtual_litter,
+        real_usdc: 0,
+        graduation_threshold,
+        pool_bump,
+        _padding: [0; 7],
+    };
+    VirtualPool::store(pool_acc, &pool)?;
+
+    Ok(())
+}
+
+// ── Deposit ─────────────────────────────────────────────────────────────────
+fn process_deposit(
+    _program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
+    if data.len() < 16 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let user = &accounts[0];
+    let config_acc = &accounts[1];
+    let pool_acc = &accounts[2];
+    let user_usdc = &accounts[3];
+    let pool_usdc = &accounts[4];
+    let litter_mint = &accounts[5];
+    let user_litter = &accounts[6];
+
+    if !user.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let mut amount_bytes = [0u8; 8];
+    let mut min_out_bytes = [0u8; 8];
+    amount_bytes.copy_from_slice(&data[0..8]);
+    min_out_bytes.copy_from_slice(&data[8..16]);
+
+    let usdc_amount = u64::from_le_bytes(amount_bytes);
+    let min_litter_out = u64::from_le_bytes(min_out_bytes);
+
+    if usdc_amount < MIN_DEPOSIT_USDC {
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    // Load and update pool
+    let mut pool = VirtualPool::load(pool_acc)?;
+    pool.virtual_usdc = pool
+        .virtual_usdc
+        .checked_add(usdc_amount)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    pool.virtual_litter = pool
+        .virtual_litter
+        .checked_sub(min_litter_out)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    pool.real_usdc = pool
+        .real_usdc
+        .checked_add(usdc_amount)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    VirtualPool::store(pool_acc, &pool)?;
+
+    // Transfer USDC from user to pool
+    Transfer {
+        source: user_usdc,
+        destination: pool_usdc,
+        authority: user,
+        amount: usdc_amount,
+program_id: None,
+    }
+    .invoke()?;
+
+    // Mint Litter tokens to user
+    let config = Config::load(config_acc)?;
+    let config_bump_bytes = [config.config_bump];
+    let seeds = seeds!(CONFIG_SEED, &config_bump_bytes);
+    let signer = Signer::from(&seeds);
+
+    MintTo {
+        mint: litter_mint,
+        destination: user_litter,
+        authority: config_acc,
+        amount: min_litter_out,
+program_id: None,
+    }
+    .invoke_signed(&[signer])?;
+
+    Ok(())
+}
+
+// ── Helper Functions ────────────────────────────────────────────────────────
+fn minimum_balance(space: usize) -> u64 {
+    if let Ok(rent) = Rent::get() {
+        return rent.minimum_balance(space);
+    }
+    890880 // Default rent for safety
+}
+
+fn create_program_account(
+    payer: &AccountInfo,
+    new_account: &AccountInfo,
+    owner: &Pubkey,
+    system_program: &AccountInfo,
+    space: usize,
+    signer: Option<&Signer>,
+) -> ProgramResult {
+    let lamports = minimum_balance(space);
+    let mut ix_data = [0u8; 4 + 8 + 8 + 32];
+    ix_data[..4].copy_from_slice(&0u32.to_le_bytes());
+    ix_data[4..12].copy_from_slice(&lamports.to_le_bytes());
+    ix_data[12..20].copy_from_slice(&(space as u64).to_le_bytes());
+    ix_data[20..52].copy_from_slice(owner.as_ref());
+
+    let ix_accounts = [
+        AccountMeta::writable_signer(payer.key()),
+        AccountMeta::writable_signer(new_account.key()),
+        AccountMeta::readonly(&SYSTEM_PROGRAM),
+    ];
+    let ix = Instruction {
+        program_id: &SYSTEM_PROGRAM,
+        data: &ix_data,
+        accounts: &ix_accounts,
+    };
+
+    if let Some(signer) = signer {
+        let signers = [signer.clone()];
+        invoke_signed::<3>(&ix, &[payer, new_account, system_program], &signers)?;
+    } else {
+        invoke_signed::<3>(&ix, &[payer, new_account, system_program], &[])?;
+    }
+    Ok(())
+}
