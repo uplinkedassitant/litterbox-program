@@ -4,9 +4,10 @@ keypair.json
 *.key
 *.pem
 .env
-.env.*
+.env.local
 *.secret
 secrets/
+private-keys/
 
 # Build artifacts
 target/
@@ -23,6 +24,7 @@ build/
 *.swo
 *~
 *.bak
+*.backup
 
 # OS files
 .DS_Store
@@ -34,3 +36,8 @@ npm-debug.log*
 
 # Dependencies
 node_modules/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
