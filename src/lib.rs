@@ -1,224 +1,130 @@
-/**
- * LitterBox Program - Fixed initialization with proper PDA creation
- * Program ID: BaLn7BEZCwsLaTqZcdogBy7B8NELJBHQn6Xt5ZnC2erq
- */
+#![no_std]
 
 use pinocchio::{
     account_info::AccountInfo,
-    instruction::{Instruction, Signer},
+    entrypoint,
+    instruction::{Seed, Signer},
     program_error::ProgramError,
-    pubkey::Pubkey,
-    secp256k1::signer::Secp256k1Signer,
-    syscalls,
-    system_program,
-    token_program,
+    pubkey::{self, Pubkey},
+    sysvars::{rent::Rent, Sysvar},
     ProgramResult,
 };
-use pinocchio_tkn::common::{Burn, MintTo, Transfer};
+use pinocchio_pubkey::declare_id;
+use pinocchio_system::instructions::CreateAccount;
 
-// Program ID
 declare_id!("BaLn7BEZCwsLaTqZcdogBy7B8NELJBHQn6Xt5ZnC2erq");
 
-// Seeds
 const CONFIG_SEED: &[u8] = b"config";
 const POOL_SEED: &[u8] = b"virtual_pool_v2";
-
-// Account sizes
 const CONFIG_SIZE: usize = 74;
 const POOL_SIZE: usize = 40;
 
-// Instruction discriminator
-const DISCRIMINATOR_INITIALIZE: u8 = 0;
-const DISCRIMINATOR_DEPOSIT: u8 = 1;
+entrypoint!(process_instruction);
 
-#[cfg(not(target_arch = "bpf"))]
-fn main() {}
-
-#[cfg(target_arch = "bpf")]
-#[no_mangle]
-pub extern "C" fn entrypoint(input: *mut u8) -> u64 {
-    let (program_id, accounts, data) = unsafe { syscalls::get_syscall_params(input) };
-    
-    if data.is_empty() {
-        return ProgramError::InvalidInstructionData.into();
+fn process_instruction(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
+    match data.split_first() {
+        Some((&0, rest)) => process_initialize(program_id, accounts, rest),
+        Some((&1, rest)) => process_deposit(program_id, accounts, rest),
+        _ => Err(ProgramError::InvalidInstructionData),
     }
-    
-    match data[0] {
-        DISCRIMINATOR_INITIALIZE => process_initialize(&program_id, &accounts, &data[1..]),
-        DISCRIMINATOR_DEPOSIT => process_deposit(&program_id, &accounts, &data[1..]),
-        _ => ProgramError::InvalidInstructionData.into(),
-    }
-    .into()
 }
 
-fn process_initialize(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+fn process_initialize(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
     if data.len() < 56 {
         return Err(ProgramError::InvalidInstructionData);
     }
 
-    let authority = &accounts[0];
-    let litter_mint = &accounts[1];
-    let system_program = &accounts[2];
+    let [authority, _litter_mint, config_acc, pool_acc, _system_program] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
 
     if !authority.is_signer() {
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    // Parse instruction data
-    let mut virtual_usdc_bytes = [0u8; 8];
-    let mut virtual_litter_bytes = [0u8; 8];
-    let mut threshold_bytes = [0u8; 8];
-    let mut mint_bytes = [0u8; 32];
-    
-    virtual_usdc_bytes.copy_from_slice(&data[0..8]);
-    virtual_litter_bytes.copy_from_slice(&data[8..16]);
-    threshold_bytes.copy_from_slice(&data[16..24]);
-    mint_bytes.copy_from_slice(&data[24..56]);
+    let virtual_usdc = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    let virtual_litter = u64::from_le_bytes(data[8..16].try_into().unwrap());
+    let graduation_threshold = u64::from_le_bytes(data[16..24].try_into().unwrap());
+    let litter_mint_key: Pubkey = data[24..56].try_into().unwrap();
 
-    let virtual_usdc = u64::from_le_bytes(virtual_usdc_bytes);
-    let virtual_litter = u64::from_le_bytes(virtual_litter_bytes);
-    let graduation_threshold = u64::from_le_bytes(threshold_bytes);
-    let litter_mint_key: Pubkey = mint_bytes;
-
-    // Derive PDAs
     let (config_pda, config_bump) = pubkey::find_program_address(&[CONFIG_SEED], program_id);
     let (pool_pda, pool_bump) = pubkey::find_program_address(&[POOL_SEED], program_id);
 
-    // Create Config account
-    let config_bump_bytes = [config_bump];
-    let config_seeds = seeds!(CONFIG_SEED, &config_bump_bytes);
-    let config_signer = Signer::from(&config_seeds);
+    if config_acc.key() != &config_pda {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if pool_acc.key() != &pool_pda {
+        return Err(ProgramError::InvalidAccountData);
+    }
 
-    create_program_account(
-        authority,
-        &config_pda,
-        program_id,
-        system_program,
-        CONFIG_SIZE,
-        Some(&config_signer),
-    )?;
+    let rent = Rent::get()?;
 
-    // Create Pool account
-    let pool_bump_bytes = [pool_bump];
-    let pool_seeds = seeds!(POOL_SEED, &pool_bump_bytes);
-    let pool_signer = Signer::from(&pool_seeds);
+    {
+        let bump_arr = [config_bump];
+        let seeds = [Seed::from(CONFIG_SEED), Seed::from(bump_arr.as_slice())];
+        let signer = Signer::from(&seeds);
+        CreateAccount {
+            from: authority,
+            to: config_acc,
+            lamports: rent.minimum_balance(CONFIG_SIZE),
+            space: CONFIG_SIZE as u64,
+            owner: program_id,
+        }.invoke_signed(&[signer])?;
+    }
 
-    create_program_account(
-        authority,
-        &pool_pda,
-        program_id,
-        system_program,
-        POOL_SIZE,
-        Some(&pool_signer),
-    )?;
+    {
+        let bump_arr = [pool_bump];
+        let seeds = [Seed::from(POOL_SEED), Seed::from(bump_arr.as_slice())];
+        let signer = Signer::from(&seeds);
+        CreateAccount {
+            from: authority,
+            to: pool_acc,
+            lamports: rent.minimum_balance(POOL_SIZE),
+            space: POOL_SIZE as u64,
+            owner: program_id,
+        }.invoke_signed(&[signer])?;
+    }
 
-    // Initialize Config account data
-    let config_data = Config {
-        authority: *authority.key(),
-        litter_mint: litter_mint_key,
-        config_bump,
-        mode: 0,
-        graduation_threshold,
-    };
-    config_data.store(&config_pda)?;
+    {
+        let d = unsafe { config_acc.borrow_mut_data_unchecked() };
+        d[0..32].copy_from_slice(authority.key().as_ref());
+        d[32..64].copy_from_slice(litter_mint_key.as_ref());
+        d[64] = config_bump;
+        d[65] = 0;
+        d[66..74].copy_from_slice(&graduation_threshold.to_le_bytes());
+    }
 
-    // Initialize Pool account data
-    let pool_data = VirtualPool {
-        virtual_usdc,
-        virtual_litter,
-        real_usdc: 0,
-        graduation_threshold,
-        pool_bump,
-        _padding: [0; 7],
-    };
-    pool_data.store(&pool_pda)?;
-
-    Ok(())
-}
-
-fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    // Simplified deposit logic
-    Ok(())
-}
-
-fn create_program_account(
-    payer: &AccountInfo,
-    new_account: &Pubkey,
-    owner: &Pubkey,
-    system_program: &AccountInfo,
-    space: usize,
-    signer: Option<&Signer>,
-) -> ProgramResult {
-    let lamports = minimum_balance(space);
-    let mut ix_data = [0u8; 4 + 8 + 8 + 32];
-    ix_data[..4].copy_from_slice(&0u32.to_le_bytes());
-    ix_data[4..12].copy_from_slice(&lamports.to_le_bytes());
-    ix_data[12..20].copy_from_slice(&(space as u64).to_le_bytes());
-    ix_data[20..52].copy_from_slice(owner.as_ref());
-
-    let ix_accounts = [
-        pinocchio::account_meta::writable(payer.key()),
-        pinocchio::account_meta::writable(new_account),
-        pinocchio::account_meta::readonly(system_program.key()),
-    ];
-
-    let ix = Instruction {
-        program_id: system_program.key(),
-        data: &ix_data,
-        accounts: &ix_accounts,
-    };
-
-    if let Some(signer) = signer {
-        let signers = [signer.clone()];
-        unsafe {
-            pinocchio::invoke_signed::<3>(&ix, &[payer, new_account, system_program], &signers)?;
-        }
-    } else {
-        unsafe {
-            pinocchio::invoke_signed::<3>(&ix, &[payer, new_account, system_program], &[])?;
-        }
+    {
+        let d = unsafe { pool_acc.borrow_mut_data_unchecked() };
+        d[0..8].copy_from_slice(&virtual_usdc.to_le_bytes());
+        d[8..16].copy_from_slice(&virtual_litter.to_le_bytes());
+        d[16..24].copy_from_slice(&0u64.to_le_bytes());
+        d[24..32].copy_from_slice(&graduation_threshold.to_le_bytes());
+        d[32] = pool_bump;
     }
 
     Ok(())
 }
 
-fn minimum_balance(space: usize) -> u64 {
-    0.00140592 * 1_000_000_000 / 1000 // Approximate lamports
+fn process_deposit(_: &Pubkey, _: &[AccountInfo], _: &[u8]) -> ProgramResult {
+    Ok(())
 }
 
-#[derive(Clone, Copy)]
-struct Config {
-    authority: Pubkey,
-    litter_mint: Pubkey,
-    config_bump: u8,
-    mode: u8,
-    graduation_threshold: u64,
+#[cfg(target_arch = "bpf")]
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
+    loop {}
 }
 
-impl Config {
-    const LEN: usize = CONFIG_SIZE;
-
-    fn store(&self, account: &Pubkey) -> ProgramResult {
-        // Store config data
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy)]
-struct VirtualPool {
-    virtual_usdc: u64,
-    virtual_litter: u64,
-    real_usdc: u64,
-    graduation_threshold: u64,
-    pool_bump: u8,
-    _padding: [u8; 7],
-}
-
-impl VirtualPool {
-    const LEN: usize = POOL_SIZE;
-
-    fn store(&self, account: &Pubkey) -> ProgramResult {
-        // Store pool data
-        Ok(())
-    }
+#[panic_handler]
+fn panic_panic(_: &core::panic::PanicInfo<'_>) -> ! {
+    loop {}
 }
