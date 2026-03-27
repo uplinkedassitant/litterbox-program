@@ -120,14 +120,14 @@ fn process_deposit(
     accounts: &[AccountInfo],
     data: &[u8],
 ) -> ProgramResult {
-    // Parse deposit amount from instruction data
+    // Parse deposit amount (first 8 bytes = usdc_amount as u64 LE)
     if data.len() < 8 {
         return Err(ProgramError::InvalidInstructionData);
     }
     
     let usdc_amount = u64::from_le_bytes(data[0..8].try_into().unwrap());
     
-    // Account layout for deposit:
+    // Account layout:
     // 0. [signer, writable] user
     // 1. [writable] user_usdc_ata
     // 2. [writable] pool_usdc_ata
