@@ -1,0 +1,30 @@
+# Keypairs and secrets
+*-keypair.json
+*.json
+!Cargo.lock
+!package.json
+!tsconfig.json
+
+# Build artifacts
+target/
+*.so
+*.rlib
+*.d
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
