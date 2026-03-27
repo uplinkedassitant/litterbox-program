@@ -1,30 +1,36 @@
-# Keypairs and secrets
+# Keypairs and secrets - NEVER COMMIT
 *-keypair.json
-*.json
-!Cargo.lock
-!package.json
-!tsconfig.json
+keypair.json
+*.key
+*.pem
+.env
+.env.*
+*.secret
+secrets/
 
 # Build artifacts
 target/
 *.so
 *.rlib
 *.d
+dist/
+build/
 
-# IDE
+# IDE and editor
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
+*.bak
 
-# OS
+# OS files
 .DS_Store
 Thumbs.db
 
 # Logs
 *.log
+npm-debug.log*
 
-# Environment
-.env
-.env.local
+# Dependencies
+node_modules/
