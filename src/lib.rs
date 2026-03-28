@@ -150,7 +150,7 @@ fn process_deposit(
     let pool_acc = &accounts[4];
     let user_litter_ata = &accounts[5];
     let litter_mint = &accounts[6];
-    let token_program = &accounts[7];
+    let _token_program = &accounts[7]; // Token program (not used directly, but required
     
     if !user.is_signer() {
         return Err(ProgramError::MissingRequiredSignature);
@@ -202,12 +202,14 @@ fn process_deposit(
     let seeds = [Seed::from(CONFIG_SEED), Seed::from(bump_arr.as_slice())];
     let signer = Signer::from(&seeds);
     
+    // Use regular Token program instead of Token Extensions
+    let token_program_bytes: &[u8; 32] = b"\x06\xa7\xfa\x77\xbf\x80\x70\x85\x11\x84\x8d\x71\x81\xa6\xd8\x58\x74\xc1\x0c\x85\xe6\x6c\x2b\xc2\xa2\x77\x96\x8c\xdd\x77\xb5\xd8";
     MintTo {
         mint: litter_mint,
         destination: user_litter_ata,
         authority: config_acc,
         amount: litter_amount,
-        program_id: None,
+        program_id: Some(token_program_bytes),
     }.invoke_signed(&[signer])?;
     
     // Update pool state
