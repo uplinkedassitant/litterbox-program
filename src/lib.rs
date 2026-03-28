@@ -13,7 +13,8 @@ use pinocchio_pubkey::declare_id;
 use pinocchio_system::instructions::CreateAccount;
 use pinocchio_tkn::common::{MintTo, Transfer};
 
-declare_id!("BaLn7BEZCwsLaTqZcdogBy7B8NELJBHQn6Xt5ZnC2erq");
+// Deployed Program ID on Solana Devnet
+declare_id!("5w927F3TrrRCuAQ86whve3Qe864oT1gvGFrnd7rSKY3w");
 
 const CONFIG_SEED: &[u8] = b"config";
 const POOL_SEED: &[u8] = b"virtual_pool_v2";
